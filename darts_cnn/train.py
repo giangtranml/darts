@@ -7,9 +7,14 @@ import utils
 import torchvision
 import logging, os
 from genotypes import Genotype, DARTS_
+import torch.backends.cudnn as cudnn
 
 
 def training_phase(args, device, genotype):
+	cudnn.benchmark = True
+	cudnn.enabled = True
+	torch.manual_seed(args.manual_seed)
+	torch.cuda.manual_seed(args.manual_seed)
 	C = args.init_channels
 	num_cells = args.num_cells
 	num_nodes = args.num_nodes

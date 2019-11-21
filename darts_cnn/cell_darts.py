@@ -49,17 +49,18 @@ class Cell(nn.Module):
 	`k` edges apply `k` operations to xi -> xj.
 	"""
 
-	def __init__(self, num_nodes, C_pp, C_p, C, reduction, reduction_prev):
+	def __init__(self, num_nodes, C_pp, C_p, C, reduction, reduction_prev, op_cls=MixedOp):
 		"""
 		Initialize a cell.
 
 		Parameters
 		----------
-		C_pp: number channels of the previous previous cell C[k-2]. 
-		C_p: number channels of the previous cell C[k-1]
+		C_pp: number channels of the previous previous cell C[k-2].
+		C_p: number channels of the previous cell C[k-1].
 		C: number channels of the current cell C[k]. 
 		reduction: flag to check whether this cell is reduction cell or not.
 		reduction_prev: flag to check whether previous cell is reduction cell.
+		ops_cls: operation class 
 		"""
 		super(Cell, self).__init__()
 		self.num_nodes = num_nodes
@@ -68,10 +69,9 @@ class Cell(nn.Module):
 		self.C = C
 		self.reduction = reduction
 		self.reduction_prev = reduction_prev
+		self._init_nodes(op_cls)
 
-		self._init_nodes()
-
-	def _init_nodes(self):
+	def _init_nodes(self, op_cls):
 		"""
 		Initialize nodes to create DAG with 2 input nodes come from 2 previous cell C[k-2] and C[k-1]
 		"""
@@ -86,10 +86,10 @@ class Cell(nn.Module):
 			# Creating edges connect node `i` to other nodes `j`. `j < i` 
 			for j in range(2+i):
 				stride = 2 if self.reduction and j < 2 else 1
-				op = MixedOp(self.C, stride)
+				op = op_cls(self.C, stride)
 				self.node_ops.append(op)
 
-	def forward(self, s0, s1, weights):
+	def forward(self, s0, s1, weights_alpha):
 		"""
 		Apply node-level operations with mixed operation in the cell (DAG). 
 		"""
@@ -100,7 +100,7 @@ class Cell(nn.Module):
 		offset = 0
 		for i in range(self.num_nodes):
 			# Apply operation to transform node `j` to node `i`, refer equation (1)
-			compute_node = sum((self.node_ops[offset+j](h, weights[offset+j]) for j, h in enumerate(states)))  
+			compute_node = sum((self.node_ops[offset+j](h, weights_alpha[offset+j]) for j, h in enumerate(states)))  
 			offset += len(states)
 			states.append(compute_node)
 
@@ -157,4 +157,74 @@ class DerivedCell(nn.Module):
 				s.append(h)
 			states.append(sum(s))
 		return torch.cat([states[i] for i in self.concat], dim=1)
+
+
+class MixedOpPCDarts(nn.Module):
+	
+	def __init__(self, C, stride, k=4):
+		"""
+		Parameters
+		----------
+		C: number input channels of the operation.
+		stride: stride apply to conv/pool layer.
+		k: partial channels connection hyper-parameter.
+		"""
+		super(MixedOpPCDarts, self).__init__()
+		self.k = k
+		self.ops = nn.ModuleList()
+		for primitive in PRIMITIVES:
+			op = OPS[primitive](C//k, stride, False)
+			if 'pool' in primitive:
+				op = nn.Sequential(op, nn.BatchNorm2d(C//k, affine=False))
+		self.ops.append(op)
+		self.mp = nn.MaxPool2d(2, 2)
+
+	def forward(self, x, weights):
+		channel_dim = x.shape[1]
+		x_process = x[:, :channel_dim//self.k, :, :]
+		x_bypass = x[:, channel_dim//self.k:, :, :]
+
+		out_process = sum(w * op(x_process) for w, op in zip(weights, self.ops))
+		if out_process.shape[2] == x.shape[2]:
+			out = torch.cat([out_process, x_bypass], dim=1)
+		else:
+			out = torch.cat([out_process, self.mp(x_bypass)], dim=1)
+		out = channel_shuffle(out, self.k)
+		return out
+
+def channel_shuffle(x, groups):
+    batchsize, num_channels, height, width = x.data.size()
+
+    channels_per_group = num_channels // groups
+    
+    # reshape
+    x = x.view(batchsize, groups, 
+        channels_per_group, height, width)
+
+    x = torch.transpose(x, 1, 2).contiguous()
+
+    # flatten
+    x = x.view(batchsize, -1, height, width)
+
+    return x
+
+
+class CellPCDarts(Cell):
+
+	def __init__(self, num_nodes, C_pp, C_p, C, reduction, reduction_prev, op_cls=MixedOpPCDarts):
+		super(CellPCDarts, self).__init__(num_nodes, C_pp, C_p, C, reduction, reduction_prev, op_cls)
+
+	def forward(self, s0, s1, weights_alpha, weights_beta):
+		s0 = self.node0(s0)
+		s1 = self.node1(s1)
+
+		states = [s0, s1]
+		offset = 0
+		for i in range(self.num_nodes):
+			# Apply operation to transform node `j` to node `i`, refer equation (1)
+			compute_node = sum(weights_beta[offset+j]*self.node_ops[offset+j](h, weights_alpha[offset+j]) for j, h in enumerate(states))  
+			offset += len(states)
+			states.append(compute_node)
+
+		return torch.cat(states[-self.num_nodes:], dim=1) # concat with respect to channel dimension. (N, C, H, W)	
 

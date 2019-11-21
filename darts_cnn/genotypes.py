@@ -41,12 +41,29 @@ def parse(weights, num_nodes, k_strongest):
 		- weights[5, 6, 7, 8] for third node.
 		- weights[9, 10, 11, 12, 13] for fourth node.
 	 """
+	assert PRIMITIVES.index("none") == 0, "None operation must be at the first position in PRIMITIVES"
 	gene = []
 	start = 0
 	offset = 2
 	for i in range(num_nodes):
 		end = offset + start
 		ops_max, ops_max_ind = torch.max(weights[start:end, 1:], axis=1)  # choose strongest operations for every edges, exclude 'none' operation.
+		k_max, k_max_ind = torch.topk(ops_max, k=k_strongest, axis=0) # from those strongest operations for every edges, choose k strongest edges.
+		gene.append([])
+		for k, ind in zip(k_max, k_max_ind):
+			gene[-1].append((PRIMITIVES[ops_max_ind[ops_max == k] + 1], ind.item()))
+		start += offset
+		offset += 1
+	return gene
+
+def parse_pcdarts(weights_alpha, weights_beta, num_nodes, k_strongest):
+	assert PRIMITIVES.index("none") == 0, "None operation must be at the first position in PRIMITIVES"
+	gene = []
+	start = 0
+	offset = 2
+	for i in range(num_nodes):
+		end = offset + start
+		ops_max, ops_max_ind = torch.max(weights_alpha[start:end, 1:] * weights_beta[start:end].unsqueeze(-1), axis=1)  # choose strongest operations for every edges, exclude 'none' operation.
 		k_max, k_max_ind = torch.topk(ops_max, k=k_strongest, axis=0) # from those strongest operations for every edges, choose k strongest edges.
 		gene.append([])
 		for k, ind in zip(k_max, k_max_ind):

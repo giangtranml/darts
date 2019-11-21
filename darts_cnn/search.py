@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 F = nn.functional
-from darts import DARTS, CustomDataParallel
+from darts import Darts, PCDarts
 import utils
 import torchvision
 import logging, os
@@ -13,20 +13,17 @@ def searching_phase(args, device):
 	num_classes = args.num_classes
 	criterion = nn.CrossEntropyLoss()
 	logging.info("args = %s", args)
-	darts = DARTS(C, num_cells, num_nodes, num_classes, criterion)
-	if torch.cuda.device_count() > 1:
-		darts = CustomDataParallel(darts).to(device)
-	else:
-		darts = darts.to(device)
+	darts = PCDarts(C, num_cells, num_nodes, num_classes, criterion)
+	darts = nn.DataParallel(darts).to(device)
 	weights_optimizer = torch.optim.SGD(darts.parameters(),
 										lr=args.learning_rate,
 										momentum=args.momentum,
 										weight_decay=args.weight_decay)
-	alphas_optimizer = torch.optim.Adam(darts.arch_parameters,
+	alphas_optimizer = torch.optim.Adam(darts.module.arch_parameters,
 										lr=args.arch_learning_rate,
 										betas=(0.5, 0.99),
 										weight_decay=args.arch_weight_decay)
-	darts.set_optimizers(alphas_optimizer, weights_optimizer)
+	darts.module.set_optimizers(alphas_optimizer, weights_optimizer)
 
 	train_transform, test_transform = utils.data_transform_cifar10()
 	train_data = torchvision.datasets.CIFAR10(root=args.data, train=True, transform=train_transform, download=True)
@@ -54,7 +51,7 @@ def searching_phase(args, device):
 		lr = weights_optimizer.param_groups[0]["lr"]
 		logging.info('Learning rate %e', lr)
 
-		genotype = darts.genotype()
+		genotype = darts.module.genotype()
 		logging.info('Genotype = %s', genotype)
 
 		# training
@@ -74,9 +71,8 @@ def searching_phase(args, device):
 def train(train_queue, valid_queue, model, device):
 	objs = utils.AverageMeter()
 	top1 = utils.AverageMeter()
-
+	model.train()
 	for step, (input_train, target_train) in enumerate(train_queue):
-		model.train()
 		n = input_train.size(0)
 		# get a random minibatch from the search queue with replacement
 		input_val, target_val = next(iter(valid_queue))
@@ -85,8 +81,8 @@ def train(train_queue, valid_queue, model, device):
 		input_val = input_val.to(device)
 		target_val = target_val.squeeze().long().to(device)
 
-		model.alphas_step(input_train, target_train, input_val, target_val, args.order)
-		logits, loss = model.weights_step(input_train, target_train, args.grad_clip)
+		model.module.alphas_step(input_train, target_train, input_val, target_val, args.order)
+		logits, loss = model.module.weights_step(input_train, target_train, args.grad_clip)
 
 		acc = utils.metric(logits, target_train)
 		objs.update(loss.item(), n)
@@ -106,7 +102,7 @@ def evaluate(test_queue, model, device):
 		input_test = input_test.to(device)
 		target_test = target_test.squeeze().long().to(device)
 		with torch.no_grad():
-			logits, loss = model.loss(input_test, target_test)
+			logits, loss = model.module.loss(input_test, target_test)
 
 		acc = utils.metric(logits, target_test)
 		n = input_test.size(0)

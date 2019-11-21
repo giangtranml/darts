@@ -90,6 +90,7 @@ def config(searching=True):
 	parser.add_argument('--save', type=str, default='EXP', help='experiment name')
 	parser.add_argument('--grad_clip', type=float, default=5, help='gradient clipping')
 	parser.add_argument('--train_portion', type=float, default=0.5, help='portion of training data')
+	parser.add_argument('--manual_seed', type=int, default=2, help='manual seed of the experiment')
 	parser.add_argument('--order', type=int, default=2, help='either use first-order approximation or second-order approximation')
 	parser.add_argument('--arch_learning_rate', type=float, default=3e-4, help='learning rate for architecture encoding')
 	parser.add_argument('--arch_weight_decay', type=float, default=1e-3, help='weight decay for architecture encoding')

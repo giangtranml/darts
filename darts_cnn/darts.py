@@ -1,8 +1,8 @@
 import torch
 import torch.nn as nn
 F = nn.functional
-from genotypes import PRIMITIVES, Genotype, parse
-from cell_darts import Cell, DerivedCell
+from genotypes import PRIMITIVES, Genotype, parse, parse_pcdarts
+from cell_darts import Cell, DerivedCell, CellPCDarts
 from utils import flatten_params
 from copy import deepcopy
 
@@ -11,7 +11,7 @@ def print_gpu_usage():
 	print("Memory usage of GPU %s: %s" % (device, torch.cuda.memory_allocated(device)))
 
 
-class DARTS(nn.Module):
+class Darts(nn.Module):
 	"""
 	Differentiable Architecture Search (Liu et al., 2018) https://arxiv.org/pdf/1806.09055.pdf
 
@@ -27,7 +27,7 @@ class DARTS(nn.Module):
 	In Training stage, use the searched cell to train normally to optimize `weights` (network parameters)
 	"""
 
-	def __init__(self, C, num_cells, num_nodes, num_classes, criterion, found_genotype=None):
+	def __init__(self, C, num_cells, num_nodes, num_classes, criterion, cell_cls=Cell, found_genotype=None):
 		"""
 		Parameters
 		----------
@@ -39,7 +39,7 @@ class DARTS(nn.Module):
 		criterion: use what kind of criterion to evaluate the training.
 		found_genotype: if not None, it should be the searched cell, then use for training instead of searching.
 		"""
-		super(DARTS, self).__init__()
+		super(Darts, self).__init__()
 		self.C = C
 		self.num_cells = num_cells
 		self.num_nodes = num_nodes
@@ -47,11 +47,11 @@ class DARTS(nn.Module):
 		self.criterion = criterion
 		self.found_genotype = found_genotype
 
-		self._init_cells()
+		self._init_cells(cell_cls)
 		if not found_genotype:
 			self._init_alphas()
 
-	def _init_cells(self):
+	def _init_cells(self, cell_cls):
 		self.cells = nn.ModuleList()
 		
 		stem_multiplier = 3
@@ -76,7 +76,7 @@ class DARTS(nn.Module):
 			if self.found_genotype:
 				cell = DerivedCell(self.found_genotype, C_prev_prev, C_prev, C_curr, reduction, reduction_prev, 0.2)
 			else:
-				cell = Cell(self.num_nodes, C_prev_prev, C_prev, C_curr, reduction, reduction_prev)
+				cell = cell_cls(self.num_nodes, C_prev_prev, C_prev, C_curr, reduction, reduction_prev)
 			reduction_prev = reduction
 			self.cells += [cell]
 			C_prev_prev, C_prev = C_prev, multiplier*C_curr
@@ -96,10 +96,10 @@ class DARTS(nn.Module):
 			- Third node connects 2 initial nodes, first node and second node.
 			- And so on.
 		"""
-		k = sum(2+i for i in range(self.num_nodes))
+		num_edges = sum(2+i for i in range(self.num_nodes))
 		num_ops = len(PRIMITIVES)
-		self.alphas_normal = nn.Parameter(1e-3*torch.randn(k, num_ops), requires_grad=True)
-		self.alphas_reduce = nn.Parameter(1e-3*torch.randn(k, num_ops), requires_grad=True)
+		self.alphas_normal = nn.Parameter(1e-3*torch.randn(num_edges, num_ops), requires_grad=True)
+		self.alphas_reduce = nn.Parameter(1e-3*torch.randn(num_edges, num_ops), requires_grad=True)
 		self.arch_parameters = [self.alphas_normal, self.alphas_reduce]
 
 	def set_optimizers(self, alphas_optimizer, weights_optimizer):
@@ -124,8 +124,8 @@ class DARTS(nn.Module):
 	def genotype(self):
 
 		with torch.no_grad():
-			gene_normal = parse(weights=F.softmax(self.alphas_normal, dim=-1).cpu(), num_nodes=self.num_nodes, k_strongest=2)
-			gene_reduce = parse(weights=F.softmax(self.alphas_reduce, dim=-1).cpu(), num_nodes=self.num_nodes, k_strongest=2)
+			gene_normal = parse(weights=F.softmax(self.alphas_normal, dim=-1), num_nodes=self.num_nodes, k_strongest=2)
+			gene_reduce = parse(weights=F.softmax(self.alphas_reduce, dim=-1), num_nodes=self.num_nodes, k_strongest=2)
 
 		concat = range(2, self.num_nodes+2)
 		genotype = Genotype(
@@ -217,9 +217,76 @@ class DARTS(nn.Module):
 		return logits, loss
 
 
-class CustomDataParallel(nn.DataParallel):
-	def __getattr__(self, name):
-		try:
-			return super(CustomDataParallel, self).__getattr__(name)
-		except AttributeError:
-			return getattr(self.module, name)
+class PCDarts(Darts):
+	"""
+	Partial Channel Connection Differentiable Architecture Search (PC-DARTS)
+	Paper: https://arxiv.org/pdf/1907.05737.pdf
+	"""
+
+	def __init__(self, C, num_cells, num_nodes, num_classes, criterion, cell_cls=CellPCDarts, found_genotype=None):
+		super(PCDarts, self).__init__(C, num_cells, num_nodes, num_classes, criterion, cell_cls, found_genotype)
+
+	def _init_alphas(self):
+		"""
+		Initialize `betas_normal` and `betas_reduce` use in edge normalization mentioned in the paper. 
+		`betas_normal` and `betas_reduce` has shape = (num_edges_connect).
+		"""
+		super(PCDarts, self)._init_alphas()
+		num_edges = sum(2+i for i in range(self.num_nodes))
+		self.betas_normal = nn.Parameter(1e-3*torch.randn(num_edges), requires_grad=True)
+		self.betas_reduce = nn.Parameter(1e-3*torch.randn(num_edges), requires_grad=True)
+		self.arch_parameters += [self.betas_normal, self.betas_reduce]
+
+	def forward(self, input):
+		s0 = s1 = self.initial_cell(input)
+		for i, cell in enumerate(self.cells):
+			if cell.reduction:
+				weights_alpha = F.softmax(self.alphas_reduce, dim=-1)
+				n = 3
+				start = 2
+				weights_beta = F.softmax(self.betas_reduce[0:2], dim=-1)
+				for i in range(self.num_nodes-1):
+					end = start + n
+					temp_weights_beta = F.softmax(self.betas_reduce[start:end], dim=-1)
+					start = end
+					n += 1
+					weights_beta = torch.cat([weights_beta, temp_weights_beta], dim=0)
+			else:
+				weights_alpha = F.softmax(self.alphas_normal, dim=-1)
+				n = 3
+				start = 2
+				weights_beta = F.softmax(self.betas_normal[0:2], dim=-1)
+				for i in range(self.num_nodes-1):
+					end = start + n
+					temp_weights_beta = F.softmax(self.betas_normal[start:end], dim=-1)
+					start = end
+					n += 1
+					weights_beta = torch.cat([weights_beta, temp_weights_beta], dim=0)
+			s0, s1 = s1, cell(s0, s1, weights_alpha, weights_beta)
+		out = self.global_pooling(s1)
+		logits = self.classifier(out.view(out.size(0),-1))
+		return logits
+
+	def genotype(self):
+		n = 3
+		start = 2
+		weights_beta_reduce = F.softmax(self.betas_reduce[0:2], dim=-1)
+		weights_beta_normal = F.softmax(self.betas_normal[0:2], dim=-1)
+		for i in range(self.num_nodes-1):
+			end = start + n
+			temp_weights_beta_reduce = F.softmax(self.betas_reduce[start:end], dim=-1)
+			temp_weights_beta_normal = F.softmax(self.betas_normal[start:end], dim=-1)
+			start = end
+			n += 1
+			weights_beta_reduce = torch.cat([weights_beta_reduce, temp_weights_beta_reduce], dim=0)
+			weights_beta_normal = torch.cat([weights_beta_normal, temp_weights_beta_normal], dim=0)
+		
+		gene_normal = parse_pcdarts(F.softmax(self.alphas_normal, dim=-1), weights_beta_normal, self.num_nodes, 2)
+		gene_reduce = parse_pcdarts(F.softmax(self.alphas_reduce, dim=-1), weights_beta_reduce, self.num_nodes, 2)
+
+		concat = range(2, self.num_nodes+2)
+		genotype = Genotype(
+			normal=gene_normal, normal_concat=concat,
+			reduce=gene_reduce, reduce_concat=concat
+		)
+		return genotype
