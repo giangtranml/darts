@@ -4,17 +4,34 @@ F = nn.functional
 from darts import Darts, PCDarts
 import utils
 import torchvision
-import logging, os
+import logging, os, sys
+import torch.backends.cudnn as cudnn
 
 def searching_phase(args, device):
 	C = args.init_channels
 	num_cells = args.num_cells
 	num_nodes = args.num_nodes
 	num_classes = args.num_classes
+	cudnn.benchmark = True
+	cudnn.enabled = True
+	torch.manual_seed(args.manual_seed)
+	torch.cuda.manual_seed(args.manual_seed)
+	if args.model not in ["darts", "pcdarts"]:
+		print("Model %s is not recognized" % args.model)
+		sys.exit(1)
+	else:
+		if args.model == "darts":
+			model_cls = Darts
+		else:
+			model_cls = PCDarts
 	criterion = nn.CrossEntropyLoss()
 	logging.info("args = %s", args)
-	darts = PCDarts(C, num_cells, num_nodes, num_classes, criterion)
-	darts = nn.DataParallel(darts).to(device)
+	darts = model_cls(C, num_cells, num_nodes, num_classes, criterion)
+	if args.gpus == "all":
+		gpus = None
+	else:
+		gpus = [int(gpu.strip()) for gpu in args.gpus.split(",")]
+	darts = nn.DataParallel(darts, device_ids=gpus).to(device)
 	weights_optimizer = torch.optim.SGD(darts.parameters(),
 										lr=args.learning_rate,
 										momentum=args.momentum,
@@ -72,6 +89,7 @@ def train(train_queue, valid_queue, model, device):
 	objs = utils.AverageMeter()
 	top1 = utils.AverageMeter()
 	model.train()
+
 	for step, (input_train, target_train) in enumerate(train_queue):
 		n = input_train.size(0)
 		# get a random minibatch from the search queue with replacement

@@ -27,7 +27,7 @@ class Darts(nn.Module):
 	In Training stage, use the searched cell to train normally to optimize `weights` (network parameters)
 	"""
 
-	def __init__(self, C, num_cells, num_nodes, num_classes, criterion, cell_cls=Cell, found_genotype=None):
+	def __init__(self, C, num_cells, num_nodes, num_classes, criterion, gpus=None, cell_cls=Cell, found_genotype=None):
 		"""
 		Parameters
 		----------
@@ -45,6 +45,7 @@ class Darts(nn.Module):
 		self.num_nodes = num_nodes
 		self.num_classes = num_classes
 		self.criterion = criterion
+		self.gpus = gpus
 		self.found_genotype = found_genotype
 
 		self._init_cells(cell_cls)
@@ -136,7 +137,7 @@ class Darts(nn.Module):
 		return genotype
 
 	def loss(self, X, Y):
-		logits = self(X)
+		logits = nn.parallel.data_parallel(self, X, device_ids=self.gpus)
 		return logits, self.criterion(logits, Y)
 
 	def first_order_approximation(self, X_val, Y_val):

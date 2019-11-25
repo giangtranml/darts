@@ -21,16 +21,17 @@ def training_phase(args, device, genotype):
 	num_classes = args.num_classes
 	criterion = nn.CrossEntropyLoss()
 	logging.info("args = %s", args)
+	if args.gpus == "all":
+		gpus = None
+	else:
+		gpus = [int(gpu.strip()) for gpu in args.gpus.split(",")]
 
 	train_transform, test_transform = utils.data_transform_cifar10()
 	train_data = torchvision.datasets.CIFAR10(root=args.data, train=True, transform=train_transform, download=True)
 	test_data = torchvision.datasets.CIFAR10(root=args.data, train=False, transform=test_transform)
 
 	darts = DARTS(C, num_cells, num_nodes, num_classes, criterion, found_genotype=genotype)
-	if torch.cuda.device_count() > 1:
-		darts = CustomDataParallel(darts).to(device)
-	else:
-		darts = darts.to(device)
+	darts = nn.DataParallel(darts, device_ids=gpus).to(device)
 	weights_optimizer = torch.optim.SGD(darts.parameters(),
 										lr=args.learning_rate,
 										momentum=args.momentum,
